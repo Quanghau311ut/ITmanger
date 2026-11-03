@@ -8,6 +8,8 @@ from urllib.parse import parse_qs, urlsplit
 
 from modules.asset_management.models import Asset, AssetModel, AssetStatus
 from modules.maintenance.models import MaintenanceModel
+from modules.database import Database
+from modules.persistence import SQLAssetModel, SQLMaintenanceModel
 from webapp.controllers import WebController, parse_form
 
 
@@ -15,7 +17,10 @@ ROOT = Path(__file__).resolve().parent
 MAX_FORM_BYTES = 64 * 1024
 
 
-def build_controller() -> WebController:
+def build_controller(database: Database | None = None) -> WebController:
+    if database is not None:
+        return WebController(SQLAssetModel(database), SQLMaintenanceModel(database))
+
     assets = AssetModel()
     assets.create(
         Asset(
@@ -108,7 +113,11 @@ def make_handler(controller: WebController):
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(content)))
             self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self'; form-action 'self'; frame-ancestors 'none'")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self'; style-src 'self' https://fonts.googleapis.com; "
+                "font-src https://fonts.gstatic.com; form-action 'self'; frame-ancestors 'none'",
+            )
             self.send_header("Referrer-Policy", "same-origin")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
@@ -124,7 +133,14 @@ def main() -> None:
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(build_controller()))
+    database = Database.from_env(ROOT.parent / ".env")
+    try:
+        database.initialize()
+    except (RuntimeError, ValueError) as error:
+        parser.exit(1, f"Lỗi khởi tạo database: {error}\n")
+    server = ThreadingHTTPServer(
+        (args.host, args.port), make_handler(build_controller(database))
+    )
     print(f"ITmanager đang chạy tại http://{args.host}:{args.port} (Ctrl+C để dừng)")
     try:
         server.serve_forever()
@@ -132,6 +148,7 @@ def main() -> None:
         print("\nĐang dừng ITmanager...")
     finally:
         server.server_close()
+        database.close()
 
 
 if __name__ == "__main__":

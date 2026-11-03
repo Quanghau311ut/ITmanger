@@ -84,17 +84,25 @@ class AssetModel:
 
     @staticmethod
     def _validate(asset: Asset) -> None:
-        if not asset.asset_code.strip():
-            raise ValueError("Mã tài sản không được để trống.")
-        if not asset.category.strip() or not asset.location.strip():
-            raise ValueError("Loại thiết bị và vị trí không được để trống.")
-        if not asset.value.is_finite() or asset.value < 0:
-            raise ValueError("Giá trị tài sản phải là số hữu hạn không âm.")
+        validate_asset(asset)
 
     @staticmethod
     def _snapshot(asset: Asset) -> tuple[tuple[str, str], ...]:
-        return tuple(
-            (name, repr(value))
-            for name, value in vars(asset).items()
-            if name != "history"
-        )
+        return snapshot_asset(asset)
+
+
+def validate_asset(asset: Asset) -> None:
+    if not asset.asset_code.strip():
+        raise ValueError("Mã tài sản không được để trống.")
+    if not asset.category.strip() or not asset.location.strip():
+        raise ValueError("Loại thiết bị và vị trí không được để trống.")
+    if not asset.value.is_finite() or asset.value < 0:
+        raise ValueError("Giá trị tài sản phải là số hữu hạn không âm.")
+
+
+def snapshot_asset(asset: Asset) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (name, repr(value))
+        for name, value in vars(asset).items()
+        if name != "history"
+    )

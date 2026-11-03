@@ -2,15 +2,32 @@ import re
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from html import escape
+from typing import Protocol
 from urllib.parse import parse_qs, unquote, urlencode
 
-from modules.asset_management.models import Asset, AssetModel, AssetStatus
-from modules.maintenance.models import MaintenanceModel, MaintenanceTicket, MaintenanceType
+from modules.asset_management.models import Asset, AssetStatus
+from modules.maintenance.models import MaintenanceTicket, MaintenanceType
 from webapp.views import MODULES, asset_page, dashboard, maintenance_page, module_placeholder
 
 
+class AssetRepository(Protocol):
+    def create(self, asset: Asset) -> None: ...
+
+    def get(self, asset_code: str) -> Asset: ...
+
+    def get_all(self) -> tuple[Asset, ...]: ...
+
+
+class MaintenanceRepository(Protocol):
+    def create_ticket(self, ticket: MaintenanceTicket) -> None: ...
+
+    def complete_ticket(self, ticket_id: str, completed_on: date) -> MaintenanceTicket: ...
+
+    def get_all(self) -> tuple[MaintenanceTicket, ...]: ...
+
+
 class WebController:
-    def __init__(self, assets: AssetModel, maintenance: MaintenanceModel) -> None:
+    def __init__(self, assets: AssetRepository, maintenance: MaintenanceRepository) -> None:
         self._assets = assets
         self._maintenance = maintenance
 

@@ -18,6 +18,9 @@ Mỗi module tách thành `models.py`, `controllers.py` và `views.py`. `main.py
 Chạy ứng dụng web (mặc định mở tại `http://127.0.0.1:8000`):
 
 ```powershell
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+# Chỉnh .env theo SQL Server của bạn
 python main.py
 ```
 
@@ -29,4 +32,6 @@ Chạy kiểm thử:
 python -m unittest discover -s tests
 ```
 
-Giao diện web hiện hỗ trợ dashboard, tìm kiếm/thêm tài sản và tạo/theo dõi/hoàn tất phiếu bảo trì. Các màn hình Cấp phát, Kiểm kê, Phần mềm, Nhân viên, Báo cáo và Hệ thống đang là trang khung chờ tích hợp nghiệp vụ. Dữ liệu hiện chỉ lưu trong bộ nhớ và sẽ mất khi dừng ứng dụng; cơ sở dữ liệu, đăng nhập, tải tệp, xuất Excel/PDF, barcode/QR và sao lưu/phục hồi cần được triển khai tiếp.
+Ứng dụng kết nối SQL Server theo thông tin máy chủ `192.168.1.69` và database `ITmanager` trong ảnh. Khi khởi động, ứng dụng tạo database nếu chưa có (cần quyền tạo database) và tự sinh các bảng theo schema của 8 module. Tài sản, lịch sử thay đổi và phiếu bảo trì được lưu trực tiếp vào SQL Server. Các cột văn bản dùng Unicode để bảo toàn tiếng Việt. Nếu phát hiện schema văn bản cũ, ứng dụng chỉ tạo lại các bảng tương ứng khi tất cả còn trống; nếu đã có dữ liệu, ứng dụng dừng thay vì xóa dữ liệu. `create_all()` không tự cập nhật schema đã có, nên cần sao lưu và migration rõ ràng khi thay đổi schema. Cấu hình trong `.env` (không đưa file này lên Git); mặc định dùng Windows Authentication. Nếu dùng SQL Login, đặt `SQL_SERVER_AUTH=sql`, `SQL_SERVER_USER`, `SQL_SERVER_PASSWORD`. Có thể cấu hình named instance qua `SQL_SERVER_INSTANCE`; nếu đã có chuỗi kết nối, đặt `DATABASE_URL`. Máy cần cài Microsoft ODBC Driver 18 for SQL Server.
+
+Các màn hình Cấp phát, Kiểm kê, Phần mềm, Nhân viên, Báo cáo và Hệ thống hiện vẫn là trang khung; bảng dữ liệu đã được tự tạo nhưng các luồng này chưa nối CRUD vào database. Tải tệp, xuất Excel/PDF, barcode/QR và sao lưu/phục hồi cũng cần triển khai tiếp.

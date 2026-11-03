@@ -16,11 +16,18 @@ class WebServerTests(unittest.TestCase):
         try:
             with urlopen(f"{base_url}/") as response:
                 self.assertEqual(200, response.status)
-                self.assertIn("Tổng quan", response.read().decode("utf-8"))
+                self.assertIn("font-src https://fonts.gstatic.com", response.headers["Content-Security-Policy"])
+                page = response.read().decode("utf-8")
+                self.assertIn("Tổng quan", page)
+                self.assertIn("Plus+Jakarta+Sans", page)
 
             with urlopen(f"{base_url}/static/style.css") as response:
                 self.assertEqual("text/css; charset=utf-8", response.headers["Content-Type"])
-                self.assertIn("sidebar", response.read().decode("utf-8"))
+                stylesheet = response.read().decode("utf-8")
+                self.assertIn("html { font-size: 62.5%; }", stylesheet)
+                self.assertIn("font-size: 1.6rem;", stylesheet)
+                self.assertIn("font-family: \"Plus Jakarta Sans\", sans-serif", stylesheet)
+                self.assertIn('"Plus Jakarta Sans", sans-serif', stylesheet)
 
             form = urlencode(
                 {
