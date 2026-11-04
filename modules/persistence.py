@@ -1,4 +1,7 @@
 import json
+import hashlib
+import hmac
+import secrets
 from datetime import date, datetime
 from decimal import Decimal
 
@@ -91,6 +94,18 @@ class MaintenancePartRow(Base):
     ticket: Mapped[MaintenanceTicketRow] = relationship(back_populates="parts")
 
 
+class MaintenanceScheduleRow(Base):
+    __tablename__ = "maintenance_schedules"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    asset_code: Mapped[str] = mapped_column(
+        ForeignKey("assets.asset_code"), index=True
+    )
+    due_on: Mapped[date] = mapped_column(Date)
+    interval_days: Mapped[int] = mapped_column(Integer)
+    notes: Mapped[str] = mapped_column(UnicodeText)
+
+
 class EmployeeRow(Base):
     __tablename__ = "employees"
 
@@ -140,6 +155,21 @@ class InventoryRunRow(Base):
     scans: Mapped[list["InventoryScanRow"]] = relationship(
         back_populates="run", cascade="all, delete-orphan"
     )
+    expected_assets: Mapped[list["InventoryExpectedRow"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan"
+    )
+
+
+class InventoryExpectedRow(Base):
+    __tablename__ = "inventory_expected_assets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("inventory_runs.run_id", ondelete="CASCADE"), index=True
+    )
+    asset_code: Mapped[str] = mapped_column(Unicode(100), index=True)
+    expected_location: Mapped[str] = mapped_column(Unicode(255))
+    run: Mapped[InventoryRunRow] = relationship(back_populates="expected_assets")
 
 
 class InventoryScanRow(Base):
@@ -243,6 +273,14 @@ class SQLAssetModel:
             current = self._to_domain(row)
             updated = replace(current, **changes)
             validate_asset(updated)
+            active_assignment = session.scalar(
+                select(AssignmentRow).where(
+                    AssignmentRow.asset_code == asset_code,
+                    AssignmentRow.status == "Đang cấp phát",
+                )
+            )
+            if active_assignment is not None and updated.status != AssetStatus.IN_USE:
+                raise ValueError("Không thể đổi trạng thái tài sản đang được cấp phát.")
             updated.history.append(
                 AssetChange(
                     datetime.now(),
@@ -394,6 +432,643 @@ class SQLMaintenanceModel:
             completed_on=row.completed_on,
         )
 
+
+class SQLModuleModel:
+    """Persistence operations for employee, assignment, inventory and license workflows."""
+
+    def __init__(self, database: Database) -> None:
+        if database.sessions is None:
+            raise RuntimeError("Initialize the database before creating repositories.")
+        self._sessions: sessionmaker[Session] = database.sessions
+
+    def account_count(self) -> int:
+        with self._sessions() as session:
+            return len(session.scalars(select(SystemAccountRow)).all())
+
+    def bootstrap_admin(
+        self, username: str, password: str, employee_id: str, full_name: str, email: str
+    ) -> None:
+        self._validate_password(username, password)
+        if not employee_id.strip() or not full_name.strip() or not email.strip():
+            raise ValueError("Mã nhân viên, họ tên và email là bắt buộc.")
+        with self._sessions.begin() as session:
+            if session.scalar(select(SystemAccountRow)) is not None:
+                raise ValueError("Tài khoản quản trị ban đầu đã được tạo.")
+            if session.get(EmployeeRow, employee_id.strip()) is not None:
+                raise ValueError("Mã nhân viên đã tồn tại.")
+            employee = EmployeeRow()
+            employee.employee_id = employee_id.strip()
+            employee.full_name = full_name.strip()
+            employee.department = "IT"
+            employee.position = "Quản trị hệ thống"
+            employee.email = email.strip()
+            employee.status = "Đang làm"
+            session.add(employee)
+            session.flush()
+            account = SystemAccountRow()
+            account.username = username.strip()
+            account.employee_id = employee.employee_id
+            account.password_hash = _hash_password(password)
+            account.role = "Admin"
+            account.enabled = True
+            session.add(account)
+
+    def authenticate(self, username: str, password: str) -> str | None:
+        with self._sessions() as session:
+            row = session.get(SystemAccountRow, username.strip())
+            if row is None or not row.enabled:
+                return None
+            employee = session.get(EmployeeRow, row.employee_id)
+            if employee is None or employee.status != "Đang làm":
+                return None
+            if not _verify_password(password, row.password_hash):
+                return None
+            return row.role
+
+    def account_role(self, username: str) -> str | None:
+        with self._sessions() as session:
+            row = session.get(SystemAccountRow, username)
+            if row is None or not row.enabled:
+                return None
+            employee = session.get(EmployeeRow, row.employee_id)
+            if employee is None or employee.status != "Đang làm":
+                return None
+            return row.role
+
+    def accounts(self) -> tuple[dict[str, str], ...]:
+        with self._sessions() as session:
+            return tuple(
+                {
+                    "username": row.username,
+                    "employee_id": row.employee_id,
+                    "role": row.role,
+                    "enabled": "Đang hoạt động" if row.enabled else "Đã khóa",
+                }
+                for row in session.scalars(
+                    select(SystemAccountRow).order_by(SystemAccountRow.username)
+                )
+            )
+
+    def save_account(
+        self, username: str, employee_id: str, password: str, role: str
+    ) -> None:
+        self._validate_password(username, password)
+        if role not in {"Admin", "IT Staff", "Viewer"}:
+            raise ValueError("Vai trò tài khoản không hợp lệ.")
+        with self._sessions.begin() as session:
+            if session.get(SystemAccountRow, username.strip()) is not None:
+                raise ValueError("Tên đăng nhập đã tồn tại.")
+            employee = session.get(EmployeeRow, employee_id.strip())
+            if employee is None or employee.status != "Đang làm":
+                raise ValueError("Tài khoản phải gắn với nhân viên đang làm.")
+            account = SystemAccountRow()
+            account.username = username.strip()
+            account.employee_id = employee_id.strip()
+            account.password_hash = _hash_password(password)
+            account.role = role
+            account.enabled = True
+            session.add(account)
+
+    def update_account_access(self, username: str, role: str, enabled: bool) -> None:
+        if role not in {"Admin", "IT Staff", "Viewer"}:
+            raise ValueError("Vai trò tài khoản không hợp lệ.")
+        with self._sessions.begin() as session:
+            account = session.get(SystemAccountRow, username)
+            if account is None:
+                raise KeyError(f"Không tìm thấy tài khoản '{username}'.")
+            if account.role == "Admin" and account.enabled and (
+                role != "Admin" or not enabled
+            ):
+                other_admins = session.scalars(
+                    select(SystemAccountRow).where(
+                        SystemAccountRow.role == "Admin",
+                        SystemAccountRow.enabled.is_(True),
+                        SystemAccountRow.username != username,
+                    )
+                ).all()
+                if not other_admins:
+                    raise ValueError("Không thể khóa hoặc hạ quyền Admin hoạt động cuối cùng.")
+            account.role = role
+            account.enabled = enabled
+
+    def change_password(self, username: str, current_password: str, new_password: str) -> None:
+        self._validate_password(username, new_password)
+        with self._sessions.begin() as session:
+            account = session.get(SystemAccountRow, username)
+            if account is None or not _verify_password(current_password, account.password_hash):
+                raise ValueError("Mật khẩu hiện tại không chính xác.")
+            account.password_hash = _hash_password(new_password)
+
+    @staticmethod
+    def _validate_password(username: str, password: str) -> None:
+        if not username.strip() or len(password) < 12:
+            raise ValueError("Tên đăng nhập bắt buộc; mật khẩu phải có ít nhất 12 ký tự.")
+
+    def employees(self) -> tuple[dict[str, object], ...]:
+        with self._sessions() as session:
+            return tuple(
+                {
+                    "employee_id": row.employee_id,
+                    "full_name": row.full_name,
+                    "department": row.department,
+                    "position": row.position,
+                    "email": row.email,
+                    "status": row.status,
+                }
+                for row in session.scalars(
+                    select(EmployeeRow).order_by(EmployeeRow.employee_id)
+                )
+            )
+
+    def save_employee(self, values: dict[str, str], employee_id: str | None = None) -> None:
+        employee_id = employee_id or values["employee_id"]
+        if not employee_id or not values["full_name"] or not values["email"]:
+            raise ValueError("Mã nhân viên, họ tên và email là bắt buộc.")
+        if values["status"] not in {"Đang làm", "Đã nghỉ"}:
+            raise ValueError("Trạng thái nhân viên không hợp lệ.")
+        with self._sessions.begin() as session:
+            row = session.get(EmployeeRow, employee_id)
+            if row is None:
+                row = EmployeeRow()
+                row.employee_id = employee_id
+            elif employee_id != values["employee_id"]:
+                raise ValueError("Không thể thay đổi mã nhân viên.")
+            duplicate = session.scalar(
+                select(EmployeeRow).where(
+                    EmployeeRow.email == values["email"],
+                    EmployeeRow.employee_id != employee_id,
+                )
+            )
+            if duplicate is not None:
+                raise ValueError("Email đã được sử dụng bởi nhân viên khác.")
+            row.full_name = values["full_name"]
+            row.department = values["department"]
+            row.position = values["position"]
+            row.email = values["email"]
+            row.status = values["status"]
+            if row not in session:
+                session.add(row)
+
+    def assignments(self) -> tuple[dict[str, object], ...]:
+        with self._sessions() as session:
+            rows = session.execute(
+                select(AssignmentRow, EmployeeRow.full_name, AssetRow.model)
+                .join(EmployeeRow, AssignmentRow.employee_id == EmployeeRow.employee_id)
+                .join(AssetRow, AssignmentRow.asset_code == AssetRow.asset_code)
+                .order_by(AssignmentRow.issued_on.desc())
+            )
+            return tuple(
+                {
+                    "assignment_id": assignment.assignment_id,
+                    "asset_code": assignment.asset_code,
+                    "asset_model": model,
+                    "employee_id": assignment.employee_id,
+                    "employee_name": name,
+                    "issued_on": assignment.issued_on,
+                    "due_on": assignment.due_on,
+                    "returned_on": assignment.returned_on,
+                    "return_condition": assignment.return_condition,
+                    "status": assignment.status,
+                }
+                for assignment, name, model in rows
+            )
+
+    def create_assignment(
+        self, assignment_id: str, asset_code: str, employee_id: str,
+        issued_on: date, due_on: date | None,
+    ) -> None:
+        if not assignment_id or not asset_code or not employee_id:
+            raise ValueError("Mã cấp phát, tài sản và nhân viên là bắt buộc.")
+        if due_on is not None and due_on < issued_on:
+            raise ValueError("Hạn thu hồi không thể trước ngày cấp phát.")
+        with self._sessions.begin() as session:
+            if session.get(AssignmentRow, assignment_id) is not None:
+                raise ValueError(f"Mã cấp phát '{assignment_id}' đã tồn tại.")
+            asset = session.get(AssetRow, asset_code)
+            employee = session.get(EmployeeRow, employee_id)
+            if asset is None:
+                raise ValueError(f"Không tìm thấy tài sản '{asset_code}'.")
+            if employee is None or employee.status != "Đang làm":
+                raise ValueError("Chỉ nhân viên đang làm mới được nhận tài sản.")
+            active_assignment = session.scalar(
+                select(AssignmentRow).where(
+                    AssignmentRow.asset_code == asset_code,
+                    AssignmentRow.status == "Đang cấp phát",
+                )
+            )
+            if active_assignment is not None:
+                raise ValueError(f"Tài sản '{asset_code}' đang được cấp phát.")
+            if asset.status != AssetStatus.AVAILABLE.value:
+                raise ValueError("Chỉ tài sản sẵn sàng mới được cấp phát.")
+            row = AssignmentRow()
+            row.assignment_id = assignment_id
+            row.asset_code = asset_code
+            row.employee_id = employee_id
+            row.issued_on = issued_on
+            row.due_on = due_on
+            row.status = "Đang cấp phát"
+            session.add(row)
+            asset.status = AssetStatus.IN_USE.value
+
+    def return_assignment(self, assignment_id: str, returned_on: date, condition: str) -> None:
+        if not condition.strip():
+            raise ValueError("Cần ghi nhận tình trạng thiết bị khi thu hồi.")
+        with self._sessions.begin() as session:
+            row = session.get(AssignmentRow, assignment_id)
+            if row is None:
+                raise KeyError(f"Không tìm thấy phiếu cấp phát '{assignment_id}'.")
+            if row.status != "Đang cấp phát":
+                raise ValueError("Phiếu cấp phát này đã được thu hồi.")
+            if returned_on < row.issued_on:
+                raise ValueError("Ngày thu hồi không thể trước ngày cấp phát.")
+            row.returned_on = returned_on
+            row.return_condition = condition.strip()
+            row.status = "Đã thu hồi"
+            asset = session.get(AssetRow, row.asset_code)
+            if asset is not None and asset.status == AssetStatus.IN_USE.value:
+                asset.status = AssetStatus.AVAILABLE.value
+
+    def inventory_runs(self) -> tuple[dict[str, object], ...]:
+        with self._sessions() as session:
+            rows = session.scalars(
+                select(InventoryRunRow).order_by(InventoryRunRow.created_on.desc())
+            ).all()
+            return tuple(
+                {
+                    "run_id": run.run_id,
+                    "created_on": run.created_on,
+                    "scope": run.scope,
+                    "expected_count": len(run.expected_assets),
+                    "scanned_count": len(run.scans),
+                    "discrepancies": self._inventory_discrepancies(run),
+                }
+                for run in rows
+            )
+
+    def create_inventory_run(
+        self, run_id: str, created_on: date, scope_type: str, scope_value: str
+    ) -> None:
+        with self._sessions.begin() as session:
+            if session.get(InventoryRunRow, run_id) is not None:
+                raise ValueError(f"Mã đợt kiểm kê '{run_id}' đã tồn tại.")
+            assets_query = select(AssetRow)
+            if scope_type == "location":
+                assets_query = assets_query.where(AssetRow.location == scope_value)
+                scope = f"Khu vực: {scope_value}"
+            elif scope_type == "category":
+                assets_query = assets_query.where(AssetRow.category == scope_value)
+                scope = f"Loại thiết bị: {scope_value}"
+            elif scope_type == "all":
+                scope = "Toàn công ty"
+            else:
+                raise ValueError("Phạm vi kiểm kê không hợp lệ.")
+            assets = session.scalars(assets_query).all()
+            if not assets:
+                raise ValueError("Phạm vi này chưa có tài sản để kiểm kê.")
+            run = InventoryRunRow()
+            run.run_id = run_id
+            run.created_on = created_on
+            run.scope = scope
+            expected: list[InventoryExpectedRow] = []
+            for asset in assets:
+                item = InventoryExpectedRow()
+                item.asset_code = asset.asset_code
+                item.expected_location = asset.location
+                expected.append(item)
+            run.expected_assets = expected
+            session.add(run)
+
+    def scan_inventory(
+        self, run_id: str, asset_code: str, actual_location: str
+    ) -> None:
+        if not asset_code.strip() or not actual_location.strip():
+            raise ValueError("Mã tài sản và vị trí thực tế là bắt buộc.")
+        with self._sessions.begin() as session:
+            run = session.get(InventoryRunRow, run_id)
+            if run is None:
+                raise KeyError(f"Không tìm thấy đợt kiểm kê '{run_id}'.")
+            existing = session.scalar(
+                select(InventoryScanRow).where(
+                    InventoryScanRow.run_id == run_id,
+                    InventoryScanRow.asset_code == asset_code.strip(),
+                )
+            )
+            if existing is not None:
+                existing.actual_location = actual_location.strip()
+                return
+            scan = InventoryScanRow()
+            scan.run_id = run_id
+            scan.asset_code = asset_code.strip()
+            scan.actual_location = actual_location.strip()
+            session.add(scan)
+
+    @staticmethod
+    def _inventory_discrepancies(run: InventoryRunRow) -> tuple[dict[str, str], ...]:
+        expected = {item.asset_code: item.expected_location for item in run.expected_assets}
+        scanned = {item.asset_code: item.actual_location for item in run.scans}
+        discrepancies: list[dict[str, str]] = []
+        for code in sorted(expected.keys() - scanned.keys()):
+            discrepancies.append(
+                {"asset_code": code, "type": "Thiếu", "expected": expected[code], "actual": ""}
+            )
+        for code in sorted(scanned.keys() - expected.keys()):
+            discrepancies.append(
+                {"asset_code": code, "type": "Thừa", "expected": "", "actual": scanned[code]}
+            )
+        for code in sorted(expected.keys() & scanned.keys()):
+            if expected[code] != scanned[code]:
+                discrepancies.append(
+                    {
+                        "asset_code": code,
+                        "type": "Sai vị trí",
+                        "expected": expected[code],
+                        "actual": scanned[code],
+                    }
+                )
+        return tuple(discrepancies)
+
+    def licenses(self) -> tuple[dict[str, object], ...]:
+        with self._sessions() as session:
+            rows = session.scalars(
+                select(SoftwareLicenseRow).order_by(SoftwareLicenseRow.software_name)
+            ).all()
+            return tuple(
+                {
+                    "license_id": row.license_id,
+                    "software_name": row.software_name,
+                    "license_type": row.license_type,
+                    "quantity": row.quantity,
+                    "expires_on": row.expires_on,
+                    "assignments": tuple(
+                        item.subject_id
+                        for item in session.scalars(
+                            select(LicenseAssignmentRow).where(
+                                LicenseAssignmentRow.license_id == row.license_id
+                            )
+                        )
+                    ),
+                }
+                for row in rows
+            )
+
+    def save_license(
+        self, license_id: str, software_name: str, license_type: str,
+        quantity: int, expires_on: date | None,
+    ) -> None:
+        if not license_id.strip() or not software_name.strip():
+            raise ValueError("Mã license và tên phần mềm là bắt buộc.")
+        if license_type not in {"Vĩnh viễn", "Thuê bao"} or quantity < 1:
+            raise ValueError("Loại license hoặc số lượng không hợp lệ.")
+        with self._sessions.begin() as session:
+            row = session.get(SoftwareLicenseRow, license_id)
+            if row is None:
+                row = SoftwareLicenseRow()
+                row.license_id = license_id
+                session.add(row)
+            elif quantity < len(
+                session.scalars(
+                    select(LicenseAssignmentRow).where(
+                        LicenseAssignmentRow.license_id == license_id
+                    )
+                ).all()
+            ):
+                raise ValueError("Số lượng mới nhỏ hơn số license đang được gán.")
+            row.software_name = software_name.strip()
+            row.license_type = license_type
+            row.quantity = quantity
+            row.expires_on = expires_on
+
+    def assign_license(self, license_id: str, subject_id: str) -> None:
+        if not subject_id.strip():
+            raise ValueError("Chọn người dùng hoặc thiết bị được cấp license.")
+        with self._sessions.begin() as session:
+            license_item = session.get(SoftwareLicenseRow, license_id)
+            if license_item is None:
+                raise KeyError(f"Không tìm thấy license '{license_id}'.")
+            subject = session.get(EmployeeRow, subject_id.strip())
+            asset = session.get(AssetRow, subject_id.strip())
+            if subject is None and asset is None:
+                raise ValueError("Đối tượng nhận license phải là nhân viên hoặc tài sản tồn tại.")
+            if subject is not None and subject.status != "Đang làm":
+                raise ValueError("Không thể gán license cho nhân viên đã nghỉ.")
+            existing = session.scalar(
+                select(LicenseAssignmentRow).where(
+                    LicenseAssignmentRow.license_id == license_id,
+                    LicenseAssignmentRow.subject_id == subject_id.strip(),
+                )
+            )
+            if existing is not None:
+                raise ValueError("Đối tượng này đã được gán license.")
+            count = len(
+                session.scalars(
+                    select(LicenseAssignmentRow).where(
+                        LicenseAssignmentRow.license_id == license_id
+                    )
+                ).all()
+            )
+            if count >= license_item.quantity:
+                raise ValueError("Đã sử dụng hết số lượng license.")
+            assignment = LicenseAssignmentRow()
+            assignment.license_id = license_id
+            assignment.subject_id = subject_id.strip()
+            session.add(assignment)
+
+    def unassign_license(self, license_id: str, subject_id: str) -> None:
+        with self._sessions.begin() as session:
+            row = session.scalar(
+                select(LicenseAssignmentRow).where(
+                    LicenseAssignmentRow.license_id == license_id,
+                    LicenseAssignmentRow.subject_id == subject_id,
+                )
+            )
+            if row is None:
+                raise KeyError("Không tìm thấy đối tượng được gán license.")
+            session.delete(row)
+
+    def installations(self) -> tuple[dict[str, object], ...]:
+        with self._sessions() as session:
+            rows = session.execute(
+                select(SoftwareInstallationRow, AssetRow.model).join(
+                    AssetRow, SoftwareInstallationRow.asset_code == AssetRow.asset_code
+                ).order_by(SoftwareInstallationRow.installed_on.desc())
+            )
+            return tuple(
+                {
+                    "software_name": row.software_name,
+                    "asset_code": row.asset_code,
+                    "asset_model": model,
+                    "installed_on": row.installed_on,
+                }
+                for row, model in rows
+            )
+
+    def maintenance_schedules(self) -> tuple[dict[str, object], ...]:
+        with self._sessions() as session:
+            rows = session.execute(
+                select(MaintenanceScheduleRow, AssetRow.model).join(
+                    AssetRow, MaintenanceScheduleRow.asset_code == AssetRow.asset_code
+                ).order_by(MaintenanceScheduleRow.due_on)
+            )
+            return tuple(
+                {
+                    "id": item.id,
+                    "asset_code": item.asset_code,
+                    "asset_model": model,
+                    "due_on": item.due_on,
+                    "interval_days": item.interval_days,
+                    "notes": item.notes,
+                }
+                for item, model in rows
+            )
+
+    def save_maintenance_schedule(
+        self, asset_code: str, due_on: date, interval_days: int, notes: str
+    ) -> None:
+        if interval_days < 1:
+            raise ValueError("Chu kỳ bảo trì phải từ 1 ngày trở lên.")
+        with self._sessions.begin() as session:
+            if session.get(AssetRow, asset_code) is None:
+                raise KeyError(f"Không tìm thấy tài sản '{asset_code}'.")
+            row = session.scalar(
+                select(MaintenanceScheduleRow).where(
+                    MaintenanceScheduleRow.asset_code == asset_code
+                )
+            )
+            if row is None:
+                row = MaintenanceScheduleRow()
+                row.asset_code = asset_code
+                session.add(row)
+            row.due_on = due_on
+            row.interval_days = interval_days
+            row.notes = notes.strip()
+
+    def install_software(self, software_name: str, asset_code: str, installed_on: date) -> None:
+        if not software_name.strip():
+            raise ValueError("Tên phần mềm là bắt buộc.")
+        with self._sessions.begin() as session:
+            if session.get(AssetRow, asset_code) is None:
+                raise KeyError(f"Không tìm thấy tài sản '{asset_code}'.")
+            existing = session.scalar(
+                select(SoftwareInstallationRow).where(
+                    SoftwareInstallationRow.asset_code == asset_code,
+                    SoftwareInstallationRow.software_name == software_name.strip(),
+                )
+            )
+            if existing is not None:
+                raise ValueError("Phần mềm này đã được ghi nhận trên thiết bị.")
+            installation = SoftwareInstallationRow()
+            installation.software_name = software_name.strip()
+            installation.asset_code = asset_code
+            installation.installed_on = installed_on
+            session.add(installation)
+
+    def categories(self) -> tuple[dict[str, object], ...]:
+        with self._sessions() as session:
+            return tuple(
+                {
+                    "category": row.category,
+                    "values": tuple(json.loads(row.values_json)),
+                }
+                for row in session.scalars(
+                    select(SystemCategoryRow).order_by(SystemCategoryRow.category)
+                )
+            )
+
+    def save_category(self, category: str, values: list[str]) -> None:
+        clean_values = sorted({value.strip() for value in values if value.strip()})
+        if not category.strip() or not clean_values:
+            raise ValueError("Tên danh mục và ít nhất một giá trị là bắt buộc.")
+        with self._sessions.begin() as session:
+            row = session.get(SystemCategoryRow, category.strip())
+            if row is None:
+                row = SystemCategoryRow()
+                row.category = category.strip()
+                session.add(row)
+            row.values_json = json.dumps(clean_values, ensure_ascii=False)
+
+    def audit_logs(self) -> tuple[dict[str, object], ...]:
+        with self._sessions() as session:
+            return tuple(
+                {
+                    "actor": row.actor,
+                    "action": row.action,
+                    "entity": row.entity,
+                    "entity_id": row.entity_id,
+                    "occurred_at": row.occurred_at,
+                }
+                for row in session.scalars(
+                    select(AuditLogRow).order_by(AuditLogRow.occurred_at.desc()).limit(200)
+                )
+            )
+
+    def record_activity(self, action: str, entity: str, entity_id: str, actor: str = "IT Admin") -> None:
+        with self._sessions.begin() as session:
+            row = AuditLogRow()
+            row.actor = actor
+            row.action = action
+            row.entity = entity
+            row.entity_id = entity_id
+            row.occurred_at = datetime.now()
+            session.add(row)
+
+    def report_data(self) -> dict[str, object]:
+        with self._sessions() as session:
+            assets = session.scalars(select(AssetRow)).all()
+            tickets = session.scalars(select(MaintenanceTicketRow)).all()
+            licenses = session.scalars(select(SoftwareLicenseRow)).all()
+            assignments = session.scalars(select(AssignmentRow)).all()
+            employees = {
+                row.employee_id: row for row in session.scalars(select(EmployeeRow))
+            }
+            active_owners = {
+                row.asset_code: employees[row.employee_id].department
+                for row in assignments
+                if row.status == "Đang cấp phát" and row.employee_id in employees
+            }
+            return {
+                "assets": tuple(
+                    {
+                        "asset_code": row.asset_code,
+                        "category": row.category,
+                        "status": row.status,
+                        "location": row.location,
+                        "value": row.value,
+                        "warranty_until": row.warranty_until,
+                        "department": active_owners.get(row.asset_code, "Chưa cấp phát"),
+                    }
+                    for row in assets
+                ),
+                "maintenance": tuple(
+                    {
+                        "ticket_id": row.ticket_id,
+                        "asset_code": row.asset_code,
+                        "received_on": row.received_on,
+                        "cost": row.cost,
+                    }
+                    for row in tickets
+                ),
+                "licenses": tuple(
+                    {
+                        "license_id": row.license_id,
+                        "software_name": row.software_name,
+                        "expires_on": row.expires_on,
+                        "quantity": row.quantity,
+                    }
+                    for row in licenses
+                ),
+                "assignments": tuple(
+                    {
+                        "assignment_id": row.assignment_id,
+                        "asset_code": row.asset_code,
+                        "employee_id": row.employee_id,
+                        "employee_name": employees[row.employee_id].full_name,
+                        "due_on": row.due_on,
+                        "status": row.status,
+                    }
+                    for row in assignments
+                ),
+            }
+
 def _snapshot_from_json(raw: str) -> tuple[tuple[str, str], ...]:
     values = json.loads(raw)
     if not isinstance(values, list) or any(
@@ -404,3 +1079,23 @@ def _snapshot_from_json(raw: str) -> tuple[tuple[str, str], ...]:
     ):
         raise ValueError("Invalid asset history snapshot stored in the database.")
     return tuple((item[0], item[1]) for item in values)
+
+
+def _hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 310_000)
+    return f"pbkdf2_sha256$310000${salt.hex()}${digest.hex()}"
+
+
+def _verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        algorithm, rounds, salt_hex, digest_hex = stored_hash.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        expected = bytes.fromhex(digest_hex)
+        actual = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(rounds)
+        )
+        return hmac.compare_digest(actual, expected)
+    except (ValueError, TypeError):
+        return False

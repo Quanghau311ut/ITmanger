@@ -11,7 +11,8 @@ from sqlalchemy import inspect
 from modules.asset_management.models import Asset, AssetStatus
 from modules.database import Database
 from modules.maintenance.models import MaintenanceTicket, MaintenanceType
-from modules.persistence import SQLAssetModel, SQLMaintenanceModel
+from modules.persistence import SQLAssetModel, SQLMaintenanceModel, SQLModuleModel
+from webapp.controllers import WebController
 
 
 class DatabaseTests(unittest.TestCase):
@@ -38,6 +39,8 @@ class DatabaseTests(unittest.TestCase):
                 "system_accounts",
                 "audit_logs",
                 "system_categories",
+                "inventory_expected_assets",
+                "maintenance_schedules",
             }.issubset(tables)
         )
 
@@ -142,6 +145,84 @@ class DatabaseTests(unittest.TestCase):
                 )
             finally:
                 second_database.close()
+
+    def test_module_workflows_persist_and_validate_related_records(self) -> None:
+        modules = SQLModuleModel(self.database)
+        assets = SQLAssetModel(self.database)
+        assets.create(
+            Asset(
+                "IT-FLOW-1", "SN-FLOW-1", "Máy tính", "Hãng", date(2026, 1, 1),
+                Decimal("100"), date(2027, 1, 1), "Văn phòng", AssetStatus.AVAILABLE, "Máy tính",
+            )
+        )
+        modules.save_employee(
+            {
+                "employee_id": "NV-FLOW-1",
+                "full_name": "Nguyễn Văn A",
+                "department": "IT",
+                "position": "Kỹ thuật",
+                "email": "nv-flow-1@example.test",
+                "status": "Đang làm",
+            }
+        )
+        modules.create_assignment(
+            "AS-FLOW-1", "IT-FLOW-1", "NV-FLOW-1", date(2026, 2, 1), date(2026, 3, 1)
+        )
+        self.assertEqual("Đang dùng", assets.get("IT-FLOW-1").status.value)
+        with self.assertRaisesRegex(ValueError, "đang được cấp phát"):
+            modules.create_assignment(
+                "AS-FLOW-2", "IT-FLOW-1", "NV-FLOW-1", date(2026, 2, 1), None
+            )
+        modules.return_assignment("AS-FLOW-1", date(2026, 2, 15), "Đã kiểm tra")
+        self.assertEqual("Sẵn sàng", assets.get("IT-FLOW-1").status.value)
+
+        modules.create_inventory_run("KK-FLOW-1", date(2026, 2, 1), "all", "")
+        modules.scan_inventory("KK-FLOW-1", "IT-FLOW-1", "Kho")
+        modules.scan_inventory("KK-FLOW-1", "IT-EXTRA", "Kho")
+        discrepancies = modules.inventory_runs()[0]["discrepancies"]
+        self.assertEqual({"Sai vị trí", "Thừa"}, {item["type"] for item in discrepancies})
+
+        modules.save_license("LIC-FLOW-1", "Office", "Thuê bao", 1, date(2027, 1, 1))
+        modules.assign_license("LIC-FLOW-1", "NV-FLOW-1")
+        with self.assertRaisesRegex(ValueError, "hết số lượng"):
+            modules.assign_license("LIC-FLOW-1", "IT-FLOW-1")
+        modules.install_software("Office", "IT-FLOW-1", date(2026, 2, 1))
+        modules.save_maintenance_schedule(
+            "IT-FLOW-1", date(2026, 4, 1), 180, "Vệ sinh và kiểm tra định kỳ"
+        )
+        self.assertEqual(date(2026, 4, 1), modules.maintenance_schedules()[0]["due_on"])
+        modules.save_category("Vị trí", ["Kho", "Văn phòng"])
+        modules.record_activity("Cấp phát", "Phiếu", "AS-FLOW-1")
+        modules.bootstrap_admin(
+            "admin", "secure-password-123", "NV-ADMIN", "Quản trị", "admin@example.test"
+        )
+        self.assertEqual("Admin", modules.authenticate("admin", "secure-password-123"))
+        self.assertIsNone(modules.authenticate("admin", "incorrect-password"))
+        modules.save_account(
+            "staff", "NV-FLOW-1", "staff-password-123", "IT Staff"
+        )
+        self.assertEqual("IT Staff", modules.authenticate("staff", "staff-password-123"))
+        modules.change_password("staff", "staff-password-123", "new-staff-password-123")
+        self.assertIsNone(modules.authenticate("staff", "staff-password-123"))
+        self.assertEqual("IT Staff", modules.authenticate("staff", "new-staff-password-123"))
+
+        self.assertEqual(("Kho", "Văn phòng"), modules.categories()[0]["values"])
+        self.assertEqual("Sẵn sàng", assets.get("IT-FLOW-1").status.value)
+        self.assertEqual("Office", modules.installations()[0]["software_name"])
+        self.assertTrue(modules.audit_logs())
+        controller = WebController(
+            assets, SQLMaintenanceModel(self.database), modules
+        )
+        for path in (
+            "/assets", "/assignment", "/maintenance", "/inventory", "/software",
+            "/employees", "/reports", "/system",
+        ):
+            status, html = controller.page(path)
+            self.assertEqual(200, status, path)
+            self.assertIn("<html", html)
+        filename, report = controller.export("/inventory/export/KK-FLOW-1.csv")
+        self.assertEqual("inventory_KK-FLOW-1.csv", filename)
+        self.assertIn("Sai vị trí", report)
 
 
 if __name__ == "__main__":
